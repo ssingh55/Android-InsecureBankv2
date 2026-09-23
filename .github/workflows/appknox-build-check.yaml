@@ -22,13 +22,16 @@ on:
         required: false
         default: ""
       gradleTask:
-        description: "Gradle task (blank = try bundle, then assembleDebug)"
+        description: "Gradle task (blank = baked-in default)"
         required: false
         default: ""
 
 env:
   APP_DIR: "InsecureBankv2"
   JAVA_VERSION: "8"
+  # One named debug variant. `bundle` builds every flavor x build type, which
+  # ran LibreTube and Lawnchair past the 90-minute timeout and OOM-killed Signal.
+  GRADLE_TASK: "assembleDebug"
 
 permissions:
   contents: read
@@ -46,8 +49,30 @@ jobs:
           df -h /
 
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      # Fetched separately so one private submodule (element-x-android points
+      # at element-android-enterprise) does not fail the whole checkout. The
+      # public ones still land; the build then shows whether the private one
+      # was actually needed.
+      - name: Fetch submodules (best effort)
+        run: git submodule update --init --recursive || echo "::warning::some submodules could not be fetched"
+
+      # Inspect the checkout for things a plain ./gradlew cannot handle alone.
+      - name: Detect build prerequisites
+        id: detect
+        env:
+          IN_APP_DIR: ${{ inputs.appDir }}
+        run: |
+          app_dir="${IN_APP_DIR:-$APP_DIR}"; app_dir="${app_dir:-.}"
+          props="$app_dir/gradle/wrapper/gradle-wrapper.properties"
+          if [ ! -f "$app_dir/gradle/wrapper/gradle-wrapper.jar" ] && [ -f "$props" ]; then
+            v=$(grep distributionUrl "$props" | sed -E 's/.*gradle-([0-9.]+)-.*/\1/')
+            echo "wrapper_missing_version=$v" >> "$GITHUB_OUTPUT"
+            echo "gradle-wrapper.jar missing; will run Gradle $v directly"
+          fi
+          if find . -name pubspec.yaml -not -path '*/.pub-cache/*' | grep -q .; then
+            echo "flutter=true" >> "$GITHUB_OUTPUT"; echo "Flutter module detected"
+          fi
 
       # Same two-JDK split as appknox-autofix.yaml: a ladder for toolchain
       # resolution, then the Gradle-running JDK installed last so it wins
@@ -68,25 +93,49 @@ jobs:
           distribution: temurin
           java-version: ${{ inputs.javaVersion || env.JAVA_VERSION }}
 
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.detect.outputs.wrapper_missing_version != ''
+        with:
+          gradle-version: ${{ steps.detect.outputs.wrapper_missing_version }}
+
+      - uses: subosito/flutter-action@v2
+        if: steps.detect.outputs.flutter == 'true'
+        with:
+          channel: stable
+
+      # Flutter add-to-app modules refuse to configure until `pub get` has
+      # generated their .android/ scaffolding and local.properties.
+      - name: Flutter pub get
+        if: steps.detect.outputs.flutter == 'true'
+        run: |
+          find . -name pubspec.yaml -not -path '*/.pub-cache/*' | while read -r p; do
+            (cd "$(dirname "$p")" && flutter pub get) || echo "::warning::pub get failed in $(dirname "$p")"
+          done
+
       - name: Build the app
         id: build
         env:
           IN_APP_DIR: ${{ inputs.appDir }}
           IN_TASK: ${{ inputs.gradleTask }}
+          WRAPPER_MISSING: ${{ steps.detect.outputs.wrapper_missing_version }}
         run: |
           set -o pipefail
           app_dir="${IN_APP_DIR:-$APP_DIR}"
           cd "${app_dir:-.}"
           echo "building in $(pwd) with $(java -version 2>&1 | head -1)"
 
+          # Some apps read sdk.dir from local.properties and fail without it
+          # (mastodon-android). Never overwrite one the repo committed.
+          [ -f local.properties ] || echo "sdk.dir=$ANDROID_HOME" > local.properties
+
           TOOLCHAINS="-Dorg.gradle.java.installations.fromEnv=JAVA_HOME_8_X64,JAVA_HOME_11_X64,JAVA_HOME_17_X64,JAVA_HOME_21_X64"
-          chmod +x ./gradlew
-          if [ -n "$IN_TASK" ]; then
-            ./gradlew --no-daemon $TOOLCHAINS "$IN_TASK"
+          if [ -n "$WRAPPER_MISSING" ]; then
+            gradle_cmd=gradle   # wrapper jar not committed; setup-gradle installed the pinned version
           else
-            ./gradlew --no-daemon $TOOLCHAINS bundle \
-              || ./gradlew --no-daemon $TOOLCHAINS assembleDebug
+            chmod +x ./gradlew; gradle_cmd=./gradlew
           fi
+          task="${IN_TASK:-$GRADLE_TASK}"
+          $gradle_cmd --no-daemon $TOOLCHAINS "${task:-assembleDebug}"
 
           cd "$GITHUB_WORKSPACE"
           artifact=$(find . -path '*/build/outputs/*' \( -name '*.aab' -o -name '*.apk' \) \
